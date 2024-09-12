@@ -24,6 +24,10 @@
 #include <algorithm>
 #include <set>
 #include <chrono>
+#include <thread>
+#include <mutex>
+#include <queue>
+#include <map>
 
 #include "HTMLParserBase.h"
 

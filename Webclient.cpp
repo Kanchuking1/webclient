@@ -17,16 +17,26 @@ const string USER_AGENT = "wahibsCrawler/1.1";
 set<string> seenHosts;
 set<DWORD> seenIPs;
 
+queue<string> urlsToParse;
+mutex mLock;
+
+int activeThreads = 0, Q = 0, E = 0, H = 0, D = 0, I = 0, R = 0, C = 0, L = 0, pagesParsed = 0;
+bool onGoing = true, logOutput = true;
+
+int pagesSinceLastWake = 0, bytesSinceLastWake = 0, totalBytes = 0;
+
+map<char, int> statusCodeMap;
+
 class Url {
 public:
-    string path = "/", scheme = "http", host, port="80", query, fragment;
+    string path = "/", scheme = "http", host, port = "80", query, fragment;
 
     Url() {
         query = "";
         fragment = "";
         host = "";
     }
-    
+
     Url(string _path, string _host, string _port, string _query, string _fragment) {
         path = _path;
         host = _host;
@@ -35,7 +45,7 @@ public:
         fragment = _fragment;
     }
 
-    static Url* Parse (string url) {
+    static Url* Parse(string url) {
         Url result;
 
         if (url.length() == 0) {
@@ -98,14 +108,14 @@ string to_string(Url url) {
         + "\nfragment: " + url.fragment;
 }
 
-string connectToServer(Url uri, sockaddr_in& server, string httpMethod, string connectingOn, int maxSize, string path="") {
+string connectToServer(Url uri, sockaddr_in& server, string httpMethod, string connectingOn, int maxSize, string path = "") {
     server.sin_family = AF_INET;
     server.sin_port = htons(atoi(uri.port.c_str()));
     WSADATA wsaData;
 
     WORD wVersionRequested = MAKEWORD(2, 2);
     if (WSAStartup(wVersionRequested, &wsaData) != 0) {
-        printf("WSAStartup error %d\n", WSAGetLastError());
+        logOutput&& printf("WSAStartup error %d\n", WSAGetLastError());
         WSACleanup();
         return "";
     }
@@ -113,23 +123,23 @@ string connectToServer(Url uri, sockaddr_in& server, string httpMethod, string c
     SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (sock == INVALID_SOCKET)
     {
-        printf("socket() generated error %d\n", WSAGetLastError());
+        logOutput&& printf("socket() generated error %d\n", WSAGetLastError());
         WSACleanup();
         return "";
     }
 
     if (path.size() == 0) {
-        cout << "      * Connecting on " << connectingOn << "... ";
+        logOutput&& cout << "      * Connecting on " << connectingOn << "... ";
     }
     else {
-        cout << "\tConnecting on " << connectingOn << "... ";
+        logOutput&& cout << "\tConnecting on " << connectingOn << "... ";
     }
 
     auto start = chrono::high_resolution_clock::now();
 
     if (connect(sock, (struct sockaddr*)&server, sizeof(struct sockaddr_in)) == SOCKET_ERROR)
     {
-        cout << "failed with " << WSAGetLastError () << endl;
+        logOutput&& cout << "failed with " << WSAGetLastError() << endl;
         closesocket(sock);
         WSACleanup();
         return "";
@@ -138,10 +148,10 @@ string connectToServer(Url uri, sockaddr_in& server, string httpMethod, string c
     auto end = chrono::high_resolution_clock::now();
     auto time_elapsed = chrono::duration_cast<chrono::milliseconds>(end - start).count();
 
-    cout << "done in " << time_elapsed << " ms" << endl;
+    logOutput&& cout << "done in " << time_elapsed << " ms" << endl;
 
     start = chrono::high_resolution_clock::now();
-    cout << "\tLoading... ";
+    logOutput&& cout << "\tLoading... ";
 
     char* recvBuffer = new char[INITIAL_BUFFER_SIZE];
     int allocatedSize = INITIAL_BUFFER_SIZE;
@@ -165,7 +175,7 @@ string connectToServer(Url uri, sockaddr_in& server, string httpMethod, string c
 
     int ret;
 
-    string part1 = path.size() > 0?path:uri.path;
+    string part1 = path.size() > 0 ? path : uri.path;
 
     if (path.size() == 0 && uri.query.size() > 0) {
         part1 += "?" + uri.query;
@@ -174,9 +184,12 @@ string connectToServer(Url uri, sockaddr_in& server, string httpMethod, string c
     string request = ((string)(httpMethod + " " + part1 + " HTTP/1.0\r\nHost: " + uri.host + "\r\nUser-agent: " + USER_AGENT + "\r\nConnection: close\r\n\r\n")).c_str();
 
     if (send(sock, request.c_str(), request.size(), 0) == SOCKET_ERROR) {
-        cout << "failed with " << WSAGetLastError() << endl;
+        logOutput&& cout << "failed with " << WSAGetLastError() << endl;
         return "";
     }
+
+    DWORD timeout1 = 10 * 1000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout1, sizeof(timeout1));
 
     while (true)
     {
@@ -189,39 +202,28 @@ string connectToServer(Url uri, sockaddr_in& server, string httpMethod, string c
             int bytes = recv(sock, recvBuffer + curPos, allocatedSize - curPos, 0);
             end = chrono::high_resolution_clock::now();
             time_elapsed = chrono::duration_cast<chrono::milliseconds>(end - start).count();
-            if (time_elapsed > 10000) {
-                cout << "failed with slow download" << endl;
-                recvBuffer[curPos] = '\0';
+            if (bytes == SOCKET_ERROR) {
+                if (WSAGetLastError() != WSAETIMEDOUT) {
+                    logOutput&& cout << "failed with slow download\n";
+                    closesocket(sock);
+                    WSACleanup();
+                }
+                logOutput&& cout << "failed with " << WSAGetLastError() << " on recv" << endl;
                 closesocket(sock);
                 WSACleanup();
                 return "";
             }
-            if (bytes == SOCKET_ERROR) {
-                cout << "failed with " << WSAGetLastError() << " on recv" << endl;
-                return "";
-            }
-
-            if (curPos == 0) {
-                if (bytes < 6) {
-                    cout << "failed with non-HTTP header (does not begin with HTTP/)" << endl;
-                    return "";
-                }
-                string headerStart = ((string)recvBuffer).substr(0, 5);
-
-                if (headerStart.compare("HTTP/") != 0) {
-                    cout << "failed with non-HTTP header (does not begin with HTTP/)" << endl;
-                    return "";
-                }
-            }
 
             curPos += bytes;
+            totalBytes += bytes;
+            bytesSinceLastWake += bytes;
 
             if (bytes == 0) {
                 recvBuffer[curPos] = '\0';
                 break;
             }
             if (curPos >= maxSize) {
-                cout << "failed with exceeding max" << endl;
+                logOutput&& cout << "failed with exceeding max" << endl;
                 closesocket(sock);
                 WSACleanup();
                 return "";
@@ -235,14 +237,14 @@ string connectToServer(Url uri, sockaddr_in& server, string httpMethod, string c
             }
         }
         else if (ret == SOCKET_ERROR) {
-            cout << "failed with " << WSAGetLastError() << endl;
+            logOutput&& cout << "failed with " << WSAGetLastError() << endl;
             closesocket(sock);
             WSACleanup();
             return "";
         }
         else
         {
-            cout << "failed with timeout" << endl;
+            logOutput&& cout << "failed with timeout" << endl;
             closesocket(sock);
             WSACleanup();
             return "";
@@ -250,10 +252,22 @@ string connectToServer(Url uri, sockaddr_in& server, string httpMethod, string c
     }
 
     closesocket(sock);
+    WSACleanup();
+
+    if (curPos < 6) {
+        logOutput&& cout << "failed with non-HTTP header (does not begin with HTTP/)" << endl;
+        return "";
+    }
+    string headerStart = ((string)recvBuffer).substr(0, 5);
+
+    if (headerStart.compare("HTTP/") != 0) {
+        logOutput&& cout << "failed with non-HTTP header (does not begin with HTTP/)" << endl;
+        return "";
+    }
 
     end = chrono::high_resolution_clock::now();
     time_elapsed = chrono::duration_cast<chrono::milliseconds>(end - start).count();
-    cout << "done in " << time_elapsed << " ms with " << curPos << " bytes" << endl;
+    logOutput&& cout << "done in " << time_elapsed << " ms with " << curPos << " bytes" << endl;
 
     string result = string(recvBuffer, recvBuffer + curPos);
 
@@ -263,7 +277,7 @@ string connectToServer(Url uri, sockaddr_in& server, string httpMethod, string c
 bool verifyHeader(string result, char acceptanceCode) {
     string headers = result.substr(0, result.find("\r\n\r\n"));
     string statusCode = headers.substr(9, 3);
-    cout << "\tVerifying header... status code " << statusCode << endl;
+    logOutput&& cout << "\tVerifying header... status code " << statusCode << endl;
     if (statusCode.size() == 3 && statusCode[0] == acceptanceCode) {
         return true;
     }
@@ -272,20 +286,23 @@ bool verifyHeader(string result, char acceptanceCode) {
 }
 
 bool checkHostUniqueness(string host) {
-    cout << "\tChecking host uniqueness... ";
+    logOutput&& cout << "\tChecking host uniqueness... ";
     auto hostCheck = seenHosts.insert(host);
 
     if (hostCheck.second == true) {
-        cout << "passed" << endl;
+        logOutput&& cout << "passed" << endl;
+        mLock.lock();
+        H++;
+        mLock.unlock();
         return true;
     }
     else {
-        cout << "failed" << endl;
+        logOutput&& cout << "failed" << endl;
         return false;
     }
 }
 
-bool doDNSandIPStorage(Url uri, sockaddr_in &server, bool doIPValidation) {
+bool doDNSandIPStorage(Url uri, sockaddr_in& server, bool doIPValidation) {
     WSADATA wsaData;
 
     WORD wVersionRequested = MAKEWORD(2, 2);
@@ -295,7 +312,7 @@ bool doDNSandIPStorage(Url uri, sockaddr_in &server, bool doIPValidation) {
         return false;
     }
     DWORD IP = inet_addr(uri.host.c_str());
-    cout << "\tDoing DNS...";
+    logOutput&& cout << "\tDoing DNS...";
 
     auto start = chrono::high_resolution_clock::now();
     if (IP == INADDR_NONE)
@@ -303,14 +320,17 @@ bool doDNSandIPStorage(Url uri, sockaddr_in &server, bool doIPValidation) {
         auto remote = gethostbyname(uri.host.c_str());
         if (remote == NULL)
         {
-            cout << "failed with " << WSAGetLastError() << endl;
+            logOutput&& cout << "failed with " << WSAGetLastError() << endl;
             return false;
         }
         else {
             memcpy((char*)&(server.sin_addr), remote->h_addr, remote->h_length);
             auto end = chrono::high_resolution_clock::now();
             auto time_elapsed = chrono::duration_cast<chrono::milliseconds>(end - start).count();
-            cout << "done in " << time_elapsed << " ms, found " << inet_ntoa(server.sin_addr) << endl;
+            mLock.lock();
+            D++;
+            mLock.unlock();
+            logOutput&& cout << "done in " << time_elapsed << " ms, found " << inet_ntoa(server.sin_addr) << endl;
         }
     }
     else
@@ -318,18 +338,21 @@ bool doDNSandIPStorage(Url uri, sockaddr_in &server, bool doIPValidation) {
         server.sin_addr.S_un.S_addr = IP;
         auto end = chrono::high_resolution_clock::now();
         auto time_elapsed = chrono::duration_cast<chrono::milliseconds>(end - start).count();
-        cout << "done in " << time_elapsed << " ms, found " << inet_ntoa(server.sin_addr) << endl;
+        logOutput&& cout << "done in " << time_elapsed << " ms, found " << inet_ntoa(server.sin_addr) << endl;
     }
 
     if (doIPValidation) {
-        cout << "\tChecking IP uniqueness... ";
+        logOutput&& cout << "\tChecking IP uniqueness... ";
         auto ipCheck = seenIPs.insert(server.sin_addr.S_un.S_addr);
 
         if (ipCheck.second == true) {
-            cout << "passed" << endl;
+            logOutput&& cout << "passed" << endl;
+            mLock.lock();
+            I++;
+            mLock.unlock();
         }
         else {
-            cout << "failed" << endl;
+            logOutput&& cout << "failed" << endl;
             return false;
         }
     }
@@ -341,11 +364,9 @@ bool doDNSandIPStorage(Url uri, sockaddr_in &server, bool doIPValidation) {
 
 void parseBodyandPrintHeaders(string result, string host) {
     auto start = chrono::high_resolution_clock::now();
-    cout << "      + Parsing Page... ";
+    logOutput&& cout << "      + Parsing Page... ";
     string headers = result.substr(0, result.find("\r\n\r\n"));
     string body = result.substr(result.find("\r\n\r\n") + 4);
-
-    //cout << "\nBody Start Here : " << body << endl;
 
     HTMLParserBase* parser = new HTMLParserBase;
     int nLinks = 0;
@@ -366,12 +387,16 @@ void parseBodyandPrintHeaders(string result, string host) {
     auto end = chrono::high_resolution_clock::now();
     auto time_elapsed = chrono::duration_cast<chrono::milliseconds>(end - start).count();
 
-    cout << "done in " << time_elapsed << " ms with " << nLinks << " links" << endl;
+    logOutput&& cout << "done in " << time_elapsed << " ms with " << nLinks << " links" << endl;
+    mLock.lock();
+    pagesParsed++;
+    L += nLinks;
+    mLock.unlock();
 }
 
 void printHeaders(string result) {
     string headers = result.substr(0, result.find("\r\n\r\n"));
-    cout << "----------------------------------------" << endl;
+    logOutput&& cout << "----------------------------------------" << endl;
     cout << headers << endl;
 }
 
@@ -390,7 +415,7 @@ void parseUrlRobotsandConnect(string url) {
     struct hostent* remote;
     struct sockaddr_in server;
 
-    if(!doDNSandIPStorage(uri, server, true)) return;
+    if (!doDNSandIPStorage(uri, server, true)) return;
 
     string result = connectToServer(uri, server, "HEAD", "robots", MAX_ROBOTS_SIZE, "/robots.txt");
     if (result.length() == 0) return;
@@ -428,6 +453,130 @@ void parseUrlandConnect(string url) {
     WSACleanup();
 }
 
+void printStats() {
+    onGoing = true;
+    auto t = chrono::steady_clock::now();
+    auto nextTime = t + chrono::seconds(2);
+    while (onGoing)
+    {
+        this_thread::sleep_until(nextTime);
+        printf("[%3d] %4d Q %6d E %7d H %6d D %6d I %5d R %5d C %5d L %4dK\n",
+            (int)(chrono::duration_cast<chrono::seconds>(nextTime - t).count()),
+            activeThreads,
+            urlsToParse.size(),
+            E, H, D, I, R, C, L / 1000);
+        float timeDiff = (float)(chrono::duration_cast<chrono::milliseconds>(chrono::steady_clock::now() - t).count());
+        printf("\t*** crawling %.1f pps @ %.1f Mbps\n", ((float)pagesSinceLastWake) * 1000 / (timeDiff), ((float)bytesSinceLastWake) * 8.0 / timeDiff / 1000.0);
+        nextTime += chrono::seconds(2);
+        mLock.lock();
+        pagesSinceLastWake = 0;
+        bytesSinceLastWake = 0;
+        mLock.unlock();
+    }
+}
+
+void parseUrlRobotsConnectNoOut(string url) {
+    Url* uri_ptr = Url::Parse(url);
+
+    if (!uri_ptr) return;
+
+    Url uri = *uri_ptr;
+
+    if (!checkHostUniqueness(uri.host)) return;
+
+    struct hostent* remote;
+    struct sockaddr_in server;
+
+    if (!doDNSandIPStorage(uri, server, true)) return;
+
+    string result = connectToServer(uri, server, "HEAD", "robots", MAX_ROBOTS_SIZE, "/robots.txt");
+    if (result.length() == 0) return;
+    if (!verifyHeader(result, '4')) return;
+    mLock.lock();
+    R++;
+    mLock.unlock();
+
+    result = connectToServer(uri, server, "GET", "page", MAX_PAGE_SIZE);
+    if (result.length() == 0) return;
+    string headers = result.substr(0, result.find("\r\n\r\n"));
+    string statusCode = headers.substr(9, 3);
+    mLock.lock();
+    switch (statusCode[0]) {
+    case '2':
+    case '3':
+    case '4':
+    case '5':
+        statusCodeMap[statusCode[0]]++;
+        break;
+    default:
+        statusCodeMap['o']++;
+        break;
+    }
+    C++;
+    pagesSinceLastWake++;
+    mLock.unlock();
+    if (!verifyHeader(result, '2')) return;
+
+    parseBodyandPrintHeaders(result, uri.host);
+
+    WSACleanup();
+}
+
+void parseAndCrawl() {
+    mLock.lock();
+    activeThreads++;
+    mLock.unlock();
+    while (true) {
+        mLock.lock();
+        if (urlsToParse.size() == 0) {
+            mLock.unlock();
+            break;
+        }
+        string url = urlsToParse.front();
+        urlsToParse.pop();
+        E++;
+        mLock.unlock();
+
+        parseUrlRobotsConnectNoOut(url);
+    }
+    mLock.lock();
+    activeThreads--;
+    mLock.unlock();
+}
+
+void Run(int threads) {
+    auto start = chrono::steady_clock::now();
+    vector<thread> threadList;
+
+    thread statsThread(printStats);
+    logOutput = false;
+
+    for (int i = 0; i < threads; i++) {
+        threadList.emplace_back(parseAndCrawl);
+    }
+
+    for (int i = 0; i < threads; i++) {
+        threadList[i].join();
+    }
+
+    onGoing = false;
+    statsThread.join();
+
+    auto end = chrono::steady_clock::now();
+    int timeElapsed = chrono::duration_cast<chrono::seconds>(end - start).count();
+    printf("Extracted %d URLs @ %d/s\n", E, E / timeElapsed);
+    printf("Looked Up %d DNS Names @ %d/s\n", H, H / timeElapsed);
+    printf("Attempted %d robots @ %d/s\n", I, I / timeElapsed);
+    printf("Crawled %d pages @ %d/s (%.2fMB)\n", C, C / timeElapsed, (float)totalBytes / 1000000.0);
+    printf("Parsed %d Links @ %d/s\n", L, L / timeElapsed);
+    printf("HTTP codes: 2xx = %d, 3xx = %d, 4xx = %d, 5xx = %d, other = %d\n",
+        statusCodeMap['2'],
+        statusCodeMap['3'],
+        statusCodeMap['4'],
+        statusCodeMap['5'],
+        statusCodeMap['o']);
+}
+
 int main(int argc, char** argv)
 {
     if (argc < 2) {
@@ -443,14 +592,12 @@ int main(int argc, char** argv)
     if (argc == 2) {
         string url = argv[1];
         parseUrlandConnect(url);
-    } else {
+    }
+    else {
         string threads = argv[1];
         string filename = argv[2];
 
-        if (threads.compare("1") != 0) {
-            cout << "More than one thread not allowed" << endl;
-            return 0;
-        }
+        int threadCount = atoi(threads.c_str());
 
         ifstream file(filename);
 
@@ -461,15 +608,16 @@ int main(int argc, char** argv)
             cout << "Opened " << filename << " with size " << fileSize << endl;
             string line;
             while (getline(file, line)) {
-                parseUrlRobotsandConnect(line);
+                urlsToParse.push(line);
             }
             file.close();
+
+            Run(threadCount);
         }
         else {
             cerr << "Error opening file: " << filename << endl;
         }
     }
-
 
     return 0;
 }
