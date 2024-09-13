@@ -26,7 +26,8 @@ map<string, bool> parsedUrls;
 int activeThreads = 0, Q = 0, E = 0, H = 0, D = 0, I = 0, R = 0, C = 0, L = 0;
 bool onGoing = true, logOutput = true;
 
-int pagesSinceLastWake = 0, bytesSinceLastWake = 0, totalBytes = 0;
+int pagesSinceLastWake = 0, bytesSinceLastWake = 0, totalBytes = 0, inDegreeTamu = 0, inDegreeFromTamu = 0;
+queue<string> pagesContainingTamuLinks;
 
 map<char, int> statusCodeMap;
 
@@ -246,7 +247,7 @@ string connectToServer(Url uri, sockaddr_in& server, string httpMethod, string c
 
             if ((allocatedSize - curPos) < INITIAL_BUFFER_SIZE) {
                 char* newBuffer = new char[allocatedSize * 2];
-                strcpy_s(newBuffer, allocatedSize * 2, recvBuffer);
+                strcpy_s(newBuffer, static_cast<rsize_t>(allocatedSize * 2), recvBuffer);
                 delete[] recvBuffer;
                 recvBuffer = newBuffer;
                 allocatedSize *= 2;
@@ -286,8 +287,6 @@ string connectToServer(Url uri, sockaddr_in& server, string httpMethod, string c
     logOutput&& cout << "done in " << time_elapsed << " ms with " << curPos << " bytes" << endl;
 
     string result = string(recvBuffer, recvBuffer + curPos);
-
-    delete recvBuffer;
 
     return result;
 }
@@ -391,18 +390,41 @@ void parseBody(string result, string host) {
     HTMLParserBase* parser = new HTMLParserBase;
     int nLinks = 0;
 
-    char* body_C = new char[body.size()];
+    char* body_C = new char[body.size() + 10];
     strcpy_s(body_C, body.size() + 2, body.c_str());
 
     string hostUri = "http://" + host;
-    char* uri_C = new char[hostUri.size() + 2];
+    char* uri_C = new char[hostUri.size() + 10];
     strcpy_s(uri_C, hostUri.size() + 2, hostUri.c_str());
 
     char* linkBuffer = parser->Parse(body_C, (int)strlen(body_C), uri_C, (int)strlen(uri_C), &nLinks);
 
     if (nLinks < 0) {
-        //printf("Error in parsing\n");
         nLinks = 0;
+    }
+
+    // print each URL; these are NULL-separated C strings
+    for (int i = 0; i < nLinks; i++)
+    {
+        char* link = linkBuffer + 7;
+        strchr(link, '/')[0] = '\0';
+        if (strlen(link) < 9) {
+            strchr(link, '\0')[0] = '/';
+            linkBuffer += strlen(linkBuffer) + 1;
+            continue;
+        }
+        link = link + strlen(link) - 8;
+        if (strcmp(link, "tamu.edu") == 0) {
+            mLock.lock();
+            inDegreeTamu++;
+            if (hostUri.substr(hostUri.size() - 8).compare("tamu.edu") == 0) {
+                inDegreeFromTamu++;
+            }
+            mLock.unlock();
+            break;
+        }
+        strchr(link, '\0')[0] = '/';
+        linkBuffer += strlen(linkBuffer) + 1;
     }
 
     auto end = chrono::high_resolution_clock::now();
@@ -497,7 +519,7 @@ void printStats() {
     }
 }
 
-void parseUrlRobotsConnectNoOut(string url) {
+void parseUrlRobotsConnectWithThreads(string url) {
     Url* uri_ptr = Url::Parse(url);
 
     if (!uri_ptr) return;
@@ -558,7 +580,7 @@ void parseAndCrawl() {
         E++;
         mLock.unlock();
 
-        parseUrlRobotsConnectNoOut(url);
+        parseUrlRobotsConnectWithThreads(url);
 
     }
     mLock.lock();
@@ -599,6 +621,8 @@ void Run(int threads) {
             statusCodeMap['4'],
             statusCodeMap['5'],
             statusCodeMap['o']);
+        printf("In Degree of TAMU links : %d\n", inDegreeTamu);
+        printf("In Degree of TAMU from TAMU : %d\n", inDegreeFromTamu);
     }
     catch (string error) {
         cerr << error << endl;
