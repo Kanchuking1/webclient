@@ -1,16 +1,1 @@
-http://www.symantec.com/verisign/ssl-certificates
-http://www.weatherline.net/
-http://abonnement.lesechos.fr/faq/
-http://allafrica.com/stories/201501021178.html
-http://architectureandmorality.blogspot.com/
-http://abigvictory.blogspot.com/search/label/Fluid
-http://aviation.blogactiv.eu/
-http://aviation.blogactiv.eu/
-http://zjk.focus.cn/
-http://azlist.about.com/a.htm
-http://apoyanocastigues.mx/
-http://ba.voanews.com/media/video/2563280.html
-http://irl.cs.tamu.edu/
-http://noc.thunderworx.net/cgi-bin/public/traceroute.pl
-http://rbc-dsai.iitm.ac.in/
-http://s2.irl.cs.tamu.edu/IRL7
+http://app1.vote.cntv.cn/viewResult.jsp?voteId=12795

@@ -10,8 +10,9 @@
 using namespace std;
 
 const int INITIAL_BUFFER_SIZE = 4096;
-const int MAX_ROBOTS_SIZE = 16e3;
-const int MAX_PAGE_SIZE = 2e9;
+const int MAX_ROBOTS_SIZE = 8*16e3;
+const int MAX_PAGE_SIZE = 16e6;
+const int MAX_REQUEST_TIME = 1e5;
 const string USER_AGENT = "wahibsCrawler/1.1";
 
 set<string> seenHosts;
@@ -20,7 +21,9 @@ set<DWORD> seenIPs;
 queue<string> urlsToParse;
 mutex mLock;
 
-int activeThreads = 0, Q = 0, E = 0, H = 0, D = 0, I = 0, R = 0, C = 0, L = 0, pagesParsed = 0;
+map<string, bool> parsedUrls;
+
+int activeThreads = 0, Q = 0, E = 0, H = 0, D = 0, I = 0, R = 0, C = 0, L = 0;
 bool onGoing = true, logOutput = true;
 
 int pagesSinceLastWake = 0, bytesSinceLastWake = 0, totalBytes = 0;
@@ -54,7 +57,7 @@ public:
 
         string scheme = url.substr(0, 4);
         if (scheme.compare("http") != 0) {
-            cout << "Parsing URL... failed with invalid scheme" << endl;
+            logOutput && cout << "failed with invalid scheme" << endl;
             return nullptr;
         }
 
@@ -89,7 +92,7 @@ public:
         }
 
         if (result.port.compare("") == 0 || atoi(result.port.c_str()) < 1 || atoi(result.port.c_str()) > 65535) {
-            cout << "Parsing URL... failed with invalid port" << endl;
+            logOutput && cout << "failed with invalid port" << endl;
             return nullptr;
         }
 
@@ -135,6 +138,10 @@ string connectToServer(Url uri, sockaddr_in& server, string httpMethod, string c
         logOutput&& cout << "\tConnecting on " << connectingOn << "... ";
     }
 
+    DWORD timeout1 = MAX_REQUEST_TIME;
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&timeout1, sizeof(timeout1));
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout1, sizeof(timeout1));
+
     auto start = chrono::high_resolution_clock::now();
 
     if (connect(sock, (struct sockaddr*)&server, sizeof(struct sockaddr_in)) == SOCKET_ERROR)
@@ -153,7 +160,7 @@ string connectToServer(Url uri, sockaddr_in& server, string httpMethod, string c
     start = chrono::high_resolution_clock::now();
     logOutput&& cout << "\tLoading... ";
 
-    char* recvBuffer = new char[INITIAL_BUFFER_SIZE];
+    auto recvBuffer = new char[INITIAL_BUFFER_SIZE];
     int allocatedSize = INITIAL_BUFFER_SIZE;
     int curPos = 0;
 
@@ -188,9 +195,6 @@ string connectToServer(Url uri, sockaddr_in& server, string httpMethod, string c
         return "";
     }
 
-    DWORD timeout1 = 10 * 1000;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout1, sizeof(timeout1));
-
     while (true)
     {
         // wait to see if socket has any data (see MSDN)
@@ -202,15 +206,18 @@ string connectToServer(Url uri, sockaddr_in& server, string httpMethod, string c
             int bytes = recv(sock, recvBuffer + curPos, allocatedSize - curPos, 0);
             end = chrono::high_resolution_clock::now();
             time_elapsed = chrono::duration_cast<chrono::milliseconds>(end - start).count();
+
             if (bytes == SOCKET_ERROR) {
                 if (WSAGetLastError() != WSAETIMEDOUT) {
                     logOutput&& cout << "failed with slow download\n";
                     closesocket(sock);
                     WSACleanup();
                 }
-                logOutput&& cout << "failed with " << WSAGetLastError() << " on recv" << endl;
-                closesocket(sock);
-                WSACleanup();
+                else {
+                    logOutput&& cout << "failed with " << WSAGetLastError() << " on recv" << endl;
+                    closesocket(sock);
+                    WSACleanup();
+                }
                 return "";
             }
 
@@ -222,12 +229,21 @@ string connectToServer(Url uri, sockaddr_in& server, string httpMethod, string c
                 recvBuffer[curPos] = '\0';
                 break;
             }
+
             if (curPos >= maxSize) {
                 logOutput&& cout << "failed with exceeding max" << endl;
                 closesocket(sock);
                 WSACleanup();
                 return "";
             }
+
+            if (time_elapsed > 15000) {
+                logOutput&& cout << "failed with slow download\n";
+                closesocket(sock);
+                WSACleanup();
+                return "";
+            }
+
             if ((allocatedSize - curPos) < INITIAL_BUFFER_SIZE) {
                 char* newBuffer = new char[allocatedSize * 2];
                 strcpy_s(newBuffer, allocatedSize * 2, recvBuffer);
@@ -271,6 +287,8 @@ string connectToServer(Url uri, sockaddr_in& server, string httpMethod, string c
 
     string result = string(recvBuffer, recvBuffer + curPos);
 
+    delete recvBuffer;
+
     return result;
 }
 
@@ -287,17 +305,18 @@ bool verifyHeader(string result, char acceptanceCode) {
 
 bool checkHostUniqueness(string host) {
     logOutput&& cout << "\tChecking host uniqueness... ";
+    mLock.lock();
     auto hostCheck = seenHosts.insert(host);
 
     if (hostCheck.second == true) {
         logOutput&& cout << "passed" << endl;
-        mLock.lock();
         H++;
         mLock.unlock();
         return true;
     }
     else {
         logOutput&& cout << "failed" << endl;
+        mLock.unlock();
         return false;
     }
 }
@@ -343,16 +362,17 @@ bool doDNSandIPStorage(Url uri, sockaddr_in& server, bool doIPValidation) {
 
     if (doIPValidation) {
         logOutput&& cout << "\tChecking IP uniqueness... ";
+        mLock.lock();
         auto ipCheck = seenIPs.insert(server.sin_addr.S_un.S_addr);
 
         if (ipCheck.second == true) {
             logOutput&& cout << "passed" << endl;
-            mLock.lock();
             I++;
             mLock.unlock();
         }
         else {
             logOutput&& cout << "failed" << endl;
+            mLock.unlock();
             return false;
         }
     }
@@ -362,7 +382,7 @@ bool doDNSandIPStorage(Url uri, sockaddr_in& server, bool doIPValidation) {
     return true;
 }
 
-void parseBodyandPrintHeaders(string result, string host) {
+void parseBody(string result, string host) {
     auto start = chrono::high_resolution_clock::now();
     logOutput&& cout << "      + Parsing Page... ";
     string headers = result.substr(0, result.find("\r\n\r\n"));
@@ -381,6 +401,7 @@ void parseBodyandPrintHeaders(string result, string host) {
     char* linkBuffer = parser->Parse(body_C, (int)strlen(body_C), uri_C, (int)strlen(uri_C), &nLinks);
 
     if (nLinks < 0) {
+        //printf("Error in parsing\n");
         nLinks = 0;
     }
 
@@ -389,7 +410,6 @@ void parseBodyandPrintHeaders(string result, string host) {
 
     logOutput&& cout << "done in " << time_elapsed << " ms with " << nLinks << " links" << endl;
     mLock.lock();
-    pagesParsed++;
     L += nLinks;
     mLock.unlock();
 }
@@ -425,7 +445,7 @@ void parseUrlRobotsandConnect(string url) {
     if (result.length() == 0) return;
     if (!verifyHeader(result, '2')) return;
 
-    parseBodyandPrintHeaders(result, uri.host);
+    parseBody(result, uri.host);
     WSACleanup();
 }
 
@@ -448,7 +468,7 @@ void parseUrlandConnect(string url) {
     if (result.length() == 0) return;
     if (!verifyHeader(result, '2')) return;
 
-    parseBodyandPrintHeaders(result, uri.host);
+    parseBody(result, uri.host);
     printHeaders(result);
     WSACleanup();
 }
@@ -459,14 +479,16 @@ void printStats() {
     auto nextTime = t + chrono::seconds(2);
     while (onGoing)
     {
-        this_thread::sleep_until(nextTime);
+        this_thread::sleep_for(chrono::seconds(1));
         printf("[%3d] %4d Q %6d E %7d H %6d D %6d I %5d R %5d C %5d L %4dK\n",
             (int)(chrono::duration_cast<chrono::seconds>(nextTime - t).count()),
             activeThreads,
             urlsToParse.size(),
             E, H, D, I, R, C, L / 1000);
         float timeDiff = (float)(chrono::duration_cast<chrono::milliseconds>(chrono::steady_clock::now() - t).count());
-        printf("\t*** crawling %.1f pps @ %.1f Mbps\n", ((float)pagesSinceLastWake) * 1000 / (timeDiff), ((float)bytesSinceLastWake) * 8.0 / timeDiff / 1000.0);
+        printf("\t*** crawling %.1f pps @ %.1f Mbps\n", 
+            ((float)pagesSinceLastWake) * 1000 / (timeDiff), 
+            ((float)bytesSinceLastWake) * 8.0 / timeDiff / 1000.0);
         nextTime += chrono::seconds(2);
         mLock.lock();
         pagesSinceLastWake = 0;
@@ -517,9 +539,7 @@ void parseUrlRobotsConnectNoOut(string url) {
     mLock.unlock();
     if (!verifyHeader(result, '2')) return;
 
-    parseBodyandPrintHeaders(result, uri.host);
-
-    WSACleanup();
+    parseBody(result, uri.host);
 }
 
 void parseAndCrawl() {
@@ -534,10 +554,12 @@ void parseAndCrawl() {
         }
         string url = urlsToParse.front();
         urlsToParse.pop();
+        parsedUrls[url] = false;
         E++;
         mLock.unlock();
 
         parseUrlRobotsConnectNoOut(url);
+
     }
     mLock.lock();
     activeThreads--;
@@ -545,36 +567,42 @@ void parseAndCrawl() {
 }
 
 void Run(int threads) {
-    auto start = chrono::steady_clock::now();
-    vector<thread> threadList;
+    try {
+        auto start = chrono::steady_clock::now();
+        vector<thread> threadList;
 
-    thread statsThread(printStats);
-    logOutput = false;
+        thread statsThread(printStats);
 
-    for (int i = 0; i < threads; i++) {
-        threadList.emplace_back(parseAndCrawl);
+        logOutput = false;
+
+        for (int i = 0; i < threads; i++) {
+            threadList.emplace_back(parseAndCrawl);
+        }
+
+        for (int i = 0; i < threads; i++) {
+            threadList[i].join();
+        }
+
+        onGoing = false;
+        statsThread.join();
+
+        auto end = chrono::steady_clock::now();
+        int timeElapsed = chrono::duration_cast<chrono::seconds>(end - start).count();
+        printf("Extracted %d URLs @ %d/s\n", E, E / timeElapsed);
+        printf("Looked Up %d DNS Names @ %d/s\n", H, H / timeElapsed);
+        printf("Attempted %d robots @ %d/s\n", I, I / timeElapsed);
+        printf("Crawled %d pages @ %d/s (%.2fMB)\n", C, C / timeElapsed, (float)totalBytes / 1000000.0);
+        printf("Parsed %d Links @ %d/s\n", L, L / timeElapsed);
+        printf("HTTP codes: 2xx = %d, 3xx = %d, 4xx = %d, 5xx = %d, other = %d\n",
+            statusCodeMap['2'],
+            statusCodeMap['3'],
+            statusCodeMap['4'],
+            statusCodeMap['5'],
+            statusCodeMap['o']);
     }
-
-    for (int i = 0; i < threads; i++) {
-        threadList[i].join();
+    catch (string error) {
+        cerr << error << endl;
     }
-
-    onGoing = false;
-    statsThread.join();
-
-    auto end = chrono::steady_clock::now();
-    int timeElapsed = chrono::duration_cast<chrono::seconds>(end - start).count();
-    printf("Extracted %d URLs @ %d/s\n", E, E / timeElapsed);
-    printf("Looked Up %d DNS Names @ %d/s\n", H, H / timeElapsed);
-    printf("Attempted %d robots @ %d/s\n", I, I / timeElapsed);
-    printf("Crawled %d pages @ %d/s (%.2fMB)\n", C, C / timeElapsed, (float)totalBytes / 1000000.0);
-    printf("Parsed %d Links @ %d/s\n", L, L / timeElapsed);
-    printf("HTTP codes: 2xx = %d, 3xx = %d, 4xx = %d, 5xx = %d, other = %d\n",
-        statusCodeMap['2'],
-        statusCodeMap['3'],
-        statusCodeMap['4'],
-        statusCodeMap['5'],
-        statusCodeMap['o']);
 }
 
 int main(int argc, char** argv)

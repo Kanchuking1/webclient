@@ -16,6 +16,7 @@
 // add headers that you want to pre-compile here
 #include <iostream>
 #include <fstream>
+#include <thread>
 
 #define _WINSOCK_DEPRECATED_NO_WARNINGS
 
@@ -24,7 +25,6 @@
 #include <algorithm>
 #include <set>
 #include <chrono>
-#include <thread>
 #include <mutex>
 #include <queue>
 #include <map>
