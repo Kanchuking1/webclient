@@ -17,6 +17,7 @@
 #include <iostream>
 #include <fstream>
 #include <thread>
+#include <sstream>
 
 #define _WINSOCK_DEPRECATED_NO_WARNINGS
 

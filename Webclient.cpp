@@ -26,6 +26,8 @@ map<string, bool> parsedUrls;
 int activeThreads = 0, Q = 0, E = 0, H = 0, D = 0, I = 0, R = 0, C = 0, L = 0;
 bool onGoing = true, logOutput = true;
 
+string httpVerison = "1.0";
+
 int pagesSinceLastWake = 0, bytesSinceLastWake = 0, totalBytes = 0, inDegreeTamu = 0, inDegreeFromTamu = 0;
 queue<string> pagesContainingTamuLinks;
 
@@ -112,6 +114,10 @@ string to_string(Url url) {
         + "\nfragment: " + url.fragment;
 }
 
+bool caseInsensitiveCompare(char a, char b) {
+    return std::tolower(a) == std::tolower(b);
+}
+
 string connectToServer(Url uri, sockaddr_in& server, string httpMethod, string connectingOn, int maxSize, string path = "") {
     server.sin_family = AF_INET;
     server.sin_port = htons(atoi(uri.port.c_str()));
@@ -189,7 +195,12 @@ string connectToServer(Url uri, sockaddr_in& server, string httpMethod, string c
         part1 += "?" + uri.query;
     }
 
-    string request = ((string)(httpMethod + " " + part1 + " HTTP/1.0\r\nHost: " + uri.host + "\r\nUser-agent: " + USER_AGENT + "\r\nConnection: close\r\n\r\n")).c_str();
+    string request = ((string)(httpMethod + " " + part1 + " HTTP/" + httpVerison
+        + "\r\nHost: " + uri.host
+        + "\r\nUser-agent: " + USER_AGENT
+        + "\r\nConnection: close"
+        + "\r\nAccept-Encoding: gzip, deflate, br, zstd"
+        + "\r\n\r\n")).c_str();
 
     if (send(sock, request.c_str(), request.size(), 0) == SOCKET_ERROR) {
         logOutput&& cout << "failed with " << WSAGetLastError() << endl;
@@ -381,11 +392,9 @@ bool doDNSandIPStorage(Url uri, sockaddr_in& server, bool doIPValidation) {
     return true;
 }
 
-void parseBody(string result, string host) {
+void parseBody(string body, string host) {
     auto start = chrono::high_resolution_clock::now();
     logOutput&& cout << "      + Parsing Page... ";
-    string headers = result.substr(0, result.find("\r\n\r\n"));
-    string body = result.substr(result.find("\r\n\r\n") + 4);
 
     HTMLParserBase* parser = new HTMLParserBase;
     int nLinks = 0;
@@ -403,7 +412,6 @@ void parseBody(string result, string host) {
         nLinks = 0;
     }
 
-    // print each URL; these are NULL-separated C strings
     for (int i = 0; i < nLinks; i++)
     {
         char* link = linkBuffer + 7;
@@ -629,6 +637,312 @@ void Run(int threads) {
     }
 }
 
+//string readLine(SOCKET socket, bool endLine = true) throw() {
+//    int n;
+//    string line;
+//    char c = '\0';
+//
+//    while (n = recv(socket, &c, 1, 0)) {
+//        if (c == '\n') {
+//            if (endLine) {
+//                line += c;
+//            }
+//
+//            if (line.size() > 4 && line[line.size() - 2] == '\r') {
+//
+//            }
+//        }
+//
+//        line += c;
+//    }
+//}
+
+string connectToServer11(Url uri, sockaddr_in& server, string httpMethod, string connectingOn, int maxSize, string path = "") {
+    server.sin_family = AF_INET;
+    server.sin_port = htons(atoi(uri.port.c_str()));
+    WSADATA wsaData;
+
+    WORD wVersionRequested = MAKEWORD(2, 2);
+    if (WSAStartup(wVersionRequested, &wsaData) != 0) {
+        logOutput&& printf("WSAStartup error %d\n", WSAGetLastError());
+        WSACleanup();
+        return "";
+    }
+
+    SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock == INVALID_SOCKET)
+    {
+        logOutput&& printf("socket() generated error %d\n", WSAGetLastError());
+        WSACleanup();
+        return "";
+    }
+
+    if (path.size() == 0) {
+        logOutput&& cout << "      * Connecting on " << connectingOn << "... ";
+    }
+    else {
+        logOutput&& cout << "\tConnecting on " << connectingOn << "... ";
+    }
+
+    DWORD timeout1 = MAX_REQUEST_TIME;
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&timeout1, sizeof(timeout1));
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout1, sizeof(timeout1));
+
+    auto start = chrono::high_resolution_clock::now();
+
+    if (connect(sock, (struct sockaddr*)&server, sizeof(struct sockaddr_in)) == SOCKET_ERROR)
+    {
+        logOutput&& cout << "failed with " << WSAGetLastError() << endl;
+        closesocket(sock);
+        WSACleanup();
+        return "";
+    }
+
+    auto end = chrono::high_resolution_clock::now();
+    auto time_elapsed = chrono::duration_cast<chrono::milliseconds>(end - start).count();
+
+    logOutput&& cout << "done in " << time_elapsed << " ms" << endl;
+
+    start = chrono::high_resolution_clock::now();
+    logOutput&& cout << "\tLoading... ";
+
+    auto recvBuffer = new char[INITIAL_BUFFER_SIZE];
+    int allocatedSize = INITIAL_BUFFER_SIZE;
+    int curPos = 0;
+
+    FD_SET readFD;
+    FD_SET writeFD;
+    FD_SET exceptFD;
+
+    FD_ZERO(&readFD);
+    FD_ZERO(&writeFD);
+    FD_ZERO(&exceptFD);
+
+    FD_SET(sock, &readFD);
+    FD_SET(sock, &writeFD);
+    FD_SET(sock, &exceptFD);
+
+    timeval timeout;
+    timeout.tv_sec = 10;
+    timeout.tv_usec = 0;
+
+    int ret;
+
+    string part1 = path.size() > 0 ? path : uri.path;
+
+    if (path.size() == 0 && uri.query.size() > 0) {
+        part1 += "?" + uri.query;
+    }
+
+    string request = ((string)(httpMethod + " " + part1 + " HTTP/" + httpVerison
+        + "\r\nHost: " + uri.host
+        + "\r\nUser-agent: " + USER_AGENT
+        + "\r\nConnection: close"
+        + "\r\nAccept-Encoding: gzip, deflate, br, zstd"
+        + "\r\n\r\n")).c_str();
+
+    if (send(sock, request.c_str(), request.size(), 0) == SOCKET_ERROR) {
+        logOutput&& cout << "failed with " << WSAGetLastError() << endl;
+        return "";
+    }
+
+    while (true)
+    {
+        // wait to see if socket has any data (see MSDN)
+        ret = select(0, &readFD, &writeFD, &exceptFD, &timeout);
+
+        if (ret > 0)
+        {
+            int bytes = recv(sock, recvBuffer + curPos, allocatedSize - curPos, 0);
+            end = chrono::high_resolution_clock::now();
+            time_elapsed = chrono::duration_cast<chrono::milliseconds>(end - start).count();
+
+            if (bytes == SOCKET_ERROR) {
+                if (WSAGetLastError() != WSAETIMEDOUT) {
+                    logOutput&& cout << "failed with slow download\n";
+                    closesocket(sock);
+                    WSACleanup();
+                }
+                else {
+                    logOutput&& cout << "failed with " << WSAGetLastError() << " on recv" << endl;
+                    closesocket(sock);
+                    WSACleanup();
+                }
+                return "";
+            }
+
+            curPos += bytes;
+            totalBytes += bytes;
+            bytesSinceLastWake += bytes;
+
+            if (bytes == 0) {
+                recvBuffer[curPos] = '\0';
+                break;
+            }
+
+            if (curPos >= maxSize) {
+                logOutput&& cout << "failed with exceeding max" << endl;
+                closesocket(sock);
+                WSACleanup();
+                return "";
+            }
+
+            if (time_elapsed > 15000) {
+                logOutput&& cout << "failed with slow download\n";
+                closesocket(sock);
+                WSACleanup();
+                return "";
+            }
+
+            if ((allocatedSize - curPos) < INITIAL_BUFFER_SIZE) {
+                char* newBuffer = new char[allocatedSize * 2];
+                strcpy_s(newBuffer, static_cast<rsize_t>(allocatedSize * 2), recvBuffer);
+                delete[] recvBuffer;
+                recvBuffer = newBuffer;
+                allocatedSize *= 2;
+            }
+        }
+        else if (ret == SOCKET_ERROR) {
+            logOutput&& cout << "failed with " << WSAGetLastError() << endl;
+            closesocket(sock);
+            WSACleanup();
+            return "";
+        }
+        else
+        {
+            logOutput&& cout << "failed with timeout" << endl;
+            closesocket(sock);
+            WSACleanup();
+            return "";
+        }
+    }
+
+    closesocket(sock);
+    WSACleanup();
+
+    if (curPos < 6) {
+        logOutput&& cout << "failed with non-HTTP header (does not begin with HTTP/)" << endl;
+        return "";
+    }
+    string headerStart = ((string)recvBuffer).substr(0, 5);
+
+    if (headerStart.compare("HTTP/") != 0) {
+        logOutput&& cout << "failed with non-HTTP header (does not begin with HTTP/)" << endl;
+        return "";
+    }
+
+    end = chrono::high_resolution_clock::now();
+    time_elapsed = chrono::duration_cast<chrono::milliseconds>(end - start).count();
+    logOutput&& cout << "done in " << time_elapsed << " ms with " << curPos << " bytes" << endl;
+
+    return recvBuffer;
+}
+
+string dechunkResponse(string body) {
+    string response;
+    string::size_type pos = 0;
+
+    cout << "\tDechunking... ";
+    cout << " body size was " << body.size();
+
+    //cout << endl << body << endl;
+
+    //while (pos < body.size()) {
+    //    string::size_type endPos = body.find_first_of("\r\n", pos);
+    //    if (endPos == string::npos) {
+    //        break;
+    //    }
+
+    //    string sizeStr = body.substr(pos, endPos - pos);
+    //    string::size_type endPos2 = body.find_first_of("\r\n", pos + endPos + 2);
+    //    //cout << sizeStr << endl << body.substr(8114, 5) << endl;
+    //    unsigned int size = stoul(sizeStr, nullptr, 16);
+    //    while (body[pos + endPos + 2] == NULL) {
+    //        cout << body[pos + endPos + 2];
+    //        endPos++;
+    //    }
+    //    cout << endl << endPos << ", " 
+    //        << pos << ", " 
+    //        << size << ", " 
+    //        << (endPos2 - endPos - 2) << ", " 
+    //        << body.size() << ", "
+    //        << body.length() << "," 
+    //        << sizeof(body)
+    //        << endl;
+    //    cout << body.substr(endPos2-4) <<endl;
+    //    if (size == 0) {
+    //        break;
+    //    }
+
+    //    pos = endPos2 + 2;
+    //    response += body.substr(pos, size);
+
+    //    pos += size + 2;
+    //    break;
+    //}
+
+    istringstream iss(body);
+    string line, chunk;
+    
+    while (getline(iss, line)) {
+        int chunkSize = stoi(line, nullptr, 16);
+        if (chunkSize == 0) {
+            break;
+        }
+        int currSize = 0;
+        while (currSize < chunkSize) {
+            getline(iss, chunk);
+            currSize += chunk.size();
+        }
+        cout << endl <<line << endl << chunk << endl;
+        /*if (chunk.size() != chunkSize) {
+            throw runtime_error("Invalid chunk size");
+        }*/
+        response += chunk;
+    }
+
+    cout << ", now " << response.size() << endl;
+
+    return response;
+}
+
+void parseUrlandConnectHTTP11(string url) {
+    cout << "URL: " << url << endl;
+    cout << "\tParsing URL... ";
+    Url* uri_ptr = Url::Parse(url);
+
+    httpVerison = "1.1";
+
+    if (!uri_ptr) return;
+
+    Url uri = *uri_ptr;
+    cout << "host " << uri.host << ", port " << uri.port << ", request " << uri.query << endl;
+
+    struct hostent* remote;
+    struct sockaddr_in server;
+
+    if (!doDNSandIPStorage(uri, server, false)) return;
+    int bufferSize = 0;
+    string result = connectToServer11(uri, server, "GET", "page", MAX_PAGE_SIZE);
+    if (result.size() == 0) return;
+    if (!verifyHeader(result, '2')) return;
+
+    string headers = result.substr(0, result.find("\r\n\r\n"));
+    string body = result.substr(result.find("\r\n\r\n") + 4);
+    
+    string chunked = "Transfer-Encoding: chunked";
+
+    auto it = search(headers.begin(), headers.end(), chunked.begin(), chunked.end(), caseInsensitiveCompare);
+
+    if (it != headers.end()) {
+        body = dechunkResponse(body);
+    }
+
+    parseBody(body, uri.host);
+    printHeaders(result);
+    WSACleanup();
+}
+
 int main(int argc, char** argv)
 {
     if (argc < 2) {
@@ -643,7 +957,7 @@ int main(int argc, char** argv)
 
     if (argc == 2) {
         string url = argv[1];
-        parseUrlandConnect(url);
+        parseUrlandConnectHTTP11(url);
     }
     else {
         string threads = argv[1];
